@@ -115,46 +115,142 @@ def get_client():
                  "Then add it in `.streamlit/secrets.toml` as:\n```\nGROQ_API_KEY = \"gsk_...\"\n```")
         st.stop()
 
-def parse_questions(text):
+# ── SKIP_WORDS: cell values that are obviously not questions ─────────────────
+SKIP_WORDS = {
+    'question','questions','field','fields','no','#','s/n','sno',
+    'item','items','topic','ropa','template','description','answer',
+    'response','details','nan',''
+}
+
+def _is_question_like(text: str) -> bool:
+    """Return True if this string looks like an actual ROPA question / field."""
+    t = text.strip()
+    if not t or len(t) < 4: return False
+    if t.lower() in SKIP_WORDS: return False
+    # Skip purely numeric cells
+    if re.match(r"^\d+\.?$", t): return False
+    return True
+
+def parse_questions(text: str) -> list:
+    """Extract questions from free-form text (numbered, bulleted, or plain lines)."""
     lines = [l.strip() for l in text.splitlines() if l.strip()]
-    pat   = re.compile(r'^(?:Q(?:uestion)?\s*)?(\d+)[.):\-]\s*(.+)', re.I)
+    pat   = re.compile(r'^(?:Q(?:uestion)?\s*)?(\d+)[.):–\-]\s*(.+)', re.I)
     qs    = []
     for line in lines:
         m = pat.match(line)
-        if m: qs.append(m.group(2).strip())
-        elif line.startswith(('-','•','*','–')): qs.append(line.lstrip('-•*– ').strip())
-        elif len(lines) <= 6: qs.append(line)
-    seen,out = set(),[]
+        if m:
+            qs.append(m.group(2).strip())
+        elif line.startswith(('-','•','*','–')):
+            qs.append(line.lstrip('-•*– ').strip())
+        else:
+            # Accept plain lines too (no numbering)
+            qs.append(line)
+    seen, out = set(), []
     for q in qs:
-        if q and q.lower() not in seen: seen.add(q.lower()); out.append(q)
+        q = q.strip()
+        if q and _is_question_like(q) and q.lower() not in seen:
+            seen.add(q.lower())
+            out.append(q)
     return out
 
-def parse_template_file(f):
-    name = f.name.lower(); raw = f.read()
-    if name.endswith('.txt'): return parse_questions(raw.decode('utf-8','ignore'))
+
+def _extract_questions_from_df(df: pd.DataFrame) -> list:
+    """
+    Intelligently scan a DataFrame for question-like content.
+    Tries every column and picks the one with the most question-like values.
+    Handles:
+      - Templates with a header row ('Question', 'Field', 'No.', etc.)
+      - Questions in column 0, 1, or any column
+      - Mixed numeric / text columns
+      - Multi-row headers
+    """
+    best_col_vals = []
+
+    for col_idx in range(min(df.shape[1], 6)):   # check first 6 columns max
+        vals = []
+        for raw_val in df.iloc[:, col_idx].dropna():
+            text = str(raw_val).strip()
+            if _is_question_like(text):
+                vals.append(text)
+        if len(vals) > len(best_col_vals):
+            best_col_vals = vals
+
+    # Deduplicate while preserving order
+    seen, out = set(), []
+    for v in best_col_vals:
+        if v.lower() not in seen:
+            seen.add(v.lower())
+            out.append(v)
+    return out
+
+
+def parse_template_file(f) -> list:
+    """Parse ROPA questions from an uploaded file (XLSX, CSV, DOCX, PDF, TXT)."""
+    name = f.name.lower()
+    raw  = f.read()
+
+    # ── TXT ──────────────────────────────────────────────────────────────────
+    if name.endswith('.txt'):
+        return parse_questions(raw.decode('utf-8', 'ignore'))
+
+    # ── CSV ──────────────────────────────────────────────────────────────────
     if name.endswith('.csv'):
-        df = pd.read_csv(io.BytesIO(raw), header=None)
-        return [str(v).strip() for v in df.iloc[:,0].dropna()
-                if str(v).strip().lower() not in ('question','field','')]
-    if name.endswith(('.xlsx','.xls')):
-        df = pd.read_excel(io.BytesIO(raw), header=None)
-        return [str(v).strip() for v in df.iloc[:,0].dropna()
-                if str(v).strip().lower() not in ('question','field','')]
+        try:
+            df = pd.read_csv(io.BytesIO(raw), header=None, dtype=str)
+            qs = _extract_questions_from_df(df)
+            if not qs:
+                # Retry treating first row as header
+                df2 = pd.read_csv(io.BytesIO(raw), dtype=str)
+                qs  = _extract_questions_from_df(df2.reset_index(drop=True))
+            return qs
+        except Exception as e:
+            st.error(f"CSV parse error: {e}"); return []
+
+    # ── XLSX / XLS ───────────────────────────────────────────────────────────
+    if name.endswith(('.xlsx', '.xls')):
+        try:
+            # Try every sheet; collect questions from all sheets
+            xl = pd.ExcelFile(io.BytesIO(raw))
+            all_qs = []
+            for sheet in xl.sheet_names:
+                df = pd.read_excel(xl, sheet_name=sheet, header=None, dtype=str)
+                qs = _extract_questions_from_df(df)
+                for q in qs:
+                    if q not in all_qs:
+                        all_qs.append(q)
+            return all_qs
+        except Exception as e:
+            st.error(f"Excel parse error: {e}"); return []
+
+    # ── DOCX ─────────────────────────────────────────────────────────────────
     if name.endswith('.docx'):
         try:
             from docx import Document
-            doc = Document(io.BytesIO(raw))
-            text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+            doc  = Document(io.BytesIO(raw))
+            # Grab text from paragraphs AND table cells
+            parts = [p.text for p in doc.paragraphs if p.text.strip()]
+            for tbl in doc.tables:
+                for row in tbl.rows:
+                    for cell in row.cells:
+                        if cell.text.strip():
+                            parts.append(cell.text.strip())
+            text = "\n".join(parts)
             return parse_questions(text)
-        except: st.error("python-docx not installed."); return []
+        except Exception as e:
+            st.error(f"DOCX parse error: {e}"); return []
+
+    # ── PDF ──────────────────────────────────────────────────────────────────
     if name.endswith('.pdf'):
         try:
             from pypdf import PdfReader
             rdr  = PdfReader(io.BytesIO(raw))
             text = "".join(p.extract_text() or "" for p in rdr.pages)
             return parse_questions(text)
-        except: st.error("pypdf not installed."); return []
-    st.warning(f"Unsupported file type: {name}"); return []
+        except Exception as e:
+            st.error(f"PDF parse error: {e}"); return []
+
+    st.warning(f"Unsupported file type: {name}")
+    return []
 
 # ── Transcription (Groq Whisper-large-v3) ────────────────────────────────────
 
@@ -562,31 +658,72 @@ with tab1:
         tf = st.file_uploader("TXT · CSV · XLSX · DOCX · PDF",
                               type=["txt","csv","xlsx","xls","docx","pdf"], key="tf_ropa")
         if tf:
-            qs = parse_template_file(tf)
+            with st.spinner(f"Parsing {tf.name}…"):
+                qs = parse_template_file(tf)
             if qs:
                 st.session_state.questions = qs
-                st.markdown(f'<div class="ok">✓ Parsed {len(qs)} questions from {tf.name}</div>',
+                st.markdown(f'<div class="ok">✓ Found {len(qs)} questions in {tf.name}</div>',
                             unsafe_allow_html=True)
-        manual = st.text_area("Or paste questions (numbered or plain)", height=130,
-            placeholder="1. What personal data is processed?\n2. What is the legal basis?\n3. Retention period?")
+            else:
+                # Show what was actually in the file to help debug
+                st.markdown(
+                    f'<div class="warn">⚠️ Could not extract questions from <b>{tf.name}</b>.<br>' +
+                    'Make sure the file has question text in a column (not just numbers).<br>' +
+                    '<b>Tip:</b> Paste the questions manually in the box below instead.</div>',
+                    unsafe_allow_html=True
+                )
+                # Try to show a preview of what was found
+                try:
+                    if tf.name.lower().endswith(('.xlsx','.xls')):
+                        tf.seek(0); raw2 = tf.read()
+                        _df = pd.read_excel(io.BytesIO(raw2), header=None, dtype=str, nrows=6)
+                        st.caption("First 6 rows of your file (to see which column has questions):")
+                        st.dataframe(_df, use_container_width=True)
+                except Exception:
+                    pass
+
+        manual = st.text_area(
+            "Or paste / type questions here (one per line):",
+            height=160,
+            placeholder="1. What personal data is processed?\n2. What is the legal basis for processing?\n3. What is the retention period?\n4. Who are the data subjects?\n5. Are there any third-party data transfers?"
+        )
         if manual.strip():
             mqs = parse_questions(manual)
-            if mqs: st.session_state.questions = mqs
+            if mqs:
+                st.session_state.questions = mqs
+                st.markdown(f'<div class="ok">✓ {len(mqs)} questions ready from text input</div>',
+                            unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
-    if st.session_state.questions:
-        with st.expander(f"📋 Preview {len(st.session_state.questions)} questions"):
+    # ── Status checklist + preview ─────────────────────────────────────────
+    has_audio     = af is not None
+    has_questions = len(st.session_state.questions) > 0
+
+    if has_questions:
+        with st.expander(f"📋 Preview {len(st.session_state.questions)} questions — click to expand"):
             for i,q in enumerate(st.session_state.questions):
-                st.markdown(f'<div style="font-family:monospace;font-size:.78rem;padding:.28rem 0;'
-                            f'color:#7a92b8;border-bottom:1px solid #0f1420;">'
-                            f'<span style="color:#22c55e;margin-right:.5rem;">Q{i+1}</span>{q}</div>',
-                            unsafe_allow_html=True)
+                st.markdown(
+                    f'<div style="font-family:monospace;font-size:.78rem;padding:.28rem 0;'
+                    f'color:#7a92b8;border-bottom:1px solid #0f1420;">'
+                    f'<span style="color:#22c55e;margin-right:.5rem;">Q{i+1}</span>{q}</div>',
+                    unsafe_allow_html=True)
 
     st.markdown("<hr>", unsafe_allow_html=True)
-    ready = af is not None and len(st.session_state.questions) > 0
-    if not ready:
-        st.markdown('<div class="info">ℹ Upload a recording AND a ROPA template (or paste questions) to begin.</div>',
-                    unsafe_allow_html=True)
+
+    # Clear per-item status so user knows exactly what's missing
+    col_st1, col_st2 = st.columns(2)
+    with col_st1:
+        if has_audio:
+            st.markdown('<div class="ok">✅ Step 1 complete — recording uploaded</div>', unsafe_allow_html=True)
+        else:
+            st.markdown('<div class="warn">⬆ Step 1 — please upload a recording above</div>', unsafe_allow_html=True)
+    with col_st2:
+        if has_questions:
+            st.markdown(f'<div class="ok">✅ Step 2 complete — {len(st.session_state.questions)} questions loaded</div>', unsafe_allow_html=True)
+        else:
+            st.markdown('<div class="warn">⬆ Step 2 — upload a ROPA template or paste questions above</div>', unsafe_allow_html=True)
+
+    ready = has_audio and has_questions
 
     if st.button("⚡  Transcribe & Analyze ROPA", disabled=not ready, key="btn_ropa"):
         client = get_client()
