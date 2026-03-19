@@ -115,77 +115,184 @@ def get_client():
                  "Then add it in `.streamlit/secrets.toml` as:\n```\nGROQ_API_KEY = \"gsk_...\"\n```")
         st.stop()
 
-# ── SKIP_WORDS: cell values that are obviously not questions ─────────────────
-SKIP_WORDS = {
-    'question','questions','field','fields','no','#','s/n','sno',
-    'item','items','topic','ropa','template','description','answer',
-    'response','details','nan',''
+# ════════════════════════════════════════════════════════════════════════════
+# ROPA TEMPLATE PARSER  —  handles complex multi-sheet Excel ROPA templates
+# Strategy: use openpyxl directly for proper merged-cell support,
+#           walk every section, collect EVERY field label across ALL columns.
+# ════════════════════════════════════════════════════════════════════════════
+
+# Cell values that are structural noise, not ROPA fields
+_SKIP_EXACT = {
+    'nan','none','','yes','no','n/a','na','tbd','-','—',
+    'remarks','comments','note','notes','ref','reference',
+    'true','false','s.no','sr.no','sr no','serial no',
 }
 
-def _is_question_like(text: str) -> bool:
-    """Return True if this string looks like an actual ROPA question / field."""
+def _is_field_id(text: str) -> bool:
+    """True for structural field-id codes: 1.1  /  2.3  /  1.1.2"""
+    return bool(re.match(r'^\d+(\.\d+){0,3}\.?$', text.strip()))
+
+def _is_section_header(text: str) -> bool:
+    """True for rows like 'Section 1: Process Overview'"""
+    return bool(re.match(r'section\s*\d', text.strip(), re.I))
+
+def _clean_cell(v) -> str:
+    """Normalise a cell value to a clean string."""
+    if v is None: return ''
+    t = str(v).strip()
+    # Remove common Excel artefacts
+    t = re.sub(r'[\r\n]+', ' ', t)   # newlines → space
+    t = re.sub(r' {2,}', ' ', t)       # multiple spaces → one
+    return t.strip()
+
+def _is_good_field(text: str) -> bool:
+    """Return True if this cell looks like a genuine ROPA field label."""
     t = text.strip()
-    if not t or len(t) < 4: return False
-    if t.lower() in SKIP_WORDS: return False
-    # Skip purely numeric cells
-    if re.match(r"^\d+\.?$", t): return False
+    if not t or len(t) < 3: return False
+    if t.lower() in _SKIP_EXACT: return False
+    if _is_field_id(t): return False
+    if _is_section_header(t): return False
+    # Pure numeric
+    if re.match(r'^[\d,.]+$', t): return False
+    # Very generic single words that are not fields
+    if t.lower() in {'country','date','name','no','yes','item',
+                     'description','details','value','type','code'}:
+        # Allow them only if they have context (section prefix added below)
+        pass
+    # Truncate very long instructional text but still KEEP it —
+    # many ROPA fields have long descriptions like
+    # "Specify the type of data subject (Customers, Vendor, employee etc.)"
     return True
 
+
+def _read_xlsx_with_openpyxl(raw_bytes: bytes) -> list:
+    """
+    Read ALL ROPA field labels from an Excel file using openpyxl.
+
+    This handles:
+    • Merged cells  (field labels often span multiple rows)
+    • Multiple sheets  (skip glossary/lookup/cover sheets)
+    • Multi-section layout  (Section 1, Section 2 … N)
+    • Field labels spread horizontally across columns
+    • Long descriptive cells (keep, truncate at 250 chars)
+
+    Returns a list of strings like:
+      "[Section 1: Process Overview] Country"
+      "[Section 1: Process Overview] Function Name"
+      "[Section 2: Data Elements] Type of Personal Data Collected"
+    """
+    import openpyxl
+
+    wb = openpyxl.load_workbook(io.BytesIO(raw_bytes), data_only=True)
+
+    SKIP_SHEET_PAT = re.compile(
+        r'(glossary|lookup|ref|list|dropdown|master|cover|index|'
+        r'instruction|guide|readme|changelog|version)', re.I
+    )
+
+    all_questions = []
+    seen_keys     = set()
+
+    for sheet_name in wb.sheetnames:
+        if SKIP_SHEET_PAT.search(sheet_name):
+            continue
+
+        ws = wb[sheet_name]
+
+        # Build a 2-D grid of merged-cell-aware values
+        # openpyxl fills merged cells with None for non-anchors;
+        # we propagate the anchor value across the merge range.
+        grid = {}  # (row, col) → string value
+
+        # First pass: real cell values
+        for row in ws.iter_rows():
+            for cell in row:
+                v = _clean_cell(cell.value)
+                grid[(cell.row, cell.column)] = v
+
+        # Second pass: fill merged ranges with anchor value
+        for merge in ws.merged_cells.ranges:
+            anchor_val = grid.get((merge.min_row, merge.min_col), '')
+            for r in range(merge.min_row, merge.max_row + 1):
+                for c in range(merge.min_col, merge.max_col + 1):
+                    if not grid.get((r, c)):
+                        grid[(r, c)] = anchor_val
+
+        max_row = ws.max_row or 1
+        max_col = ws.max_column or 1
+
+        current_section = sheet_name   # default context = sheet name
+
+        row_num = 1
+        while row_num <= max_row:
+            # Collect all non-empty cells in this row
+            row_cells = []
+            for c in range(1, max_col + 1):
+                v = grid.get((row_num, c), '')
+                if v:
+                    row_cells.append(v)
+
+            if not row_cells:
+                row_num += 1
+                continue
+
+            # ── Detect section header row ─────────────────────────────────
+            # A row is a section header if ≥1 cell matches "Section N…"
+            # and most other cells are empty or field-IDs
+            section_cells = [c for c in row_cells if _is_section_header(c)]
+            if section_cells:
+                current_section = section_cells[0]
+                row_num += 1
+                continue
+
+            # ── Detect field-ID row ───────────────────────────────────────
+            # Rows like:  1.1 | 1.2 | 1.3 | 1.4  (all cells are field IDs)
+            field_id_cells = [c for c in row_cells if _is_field_id(c)]
+            if field_id_cells and len(field_id_cells) >= len(row_cells) * 0.5:
+                # This is a header/numbering row — skip it
+                row_num += 1
+                continue
+
+            # ── Collect field labels from this row ────────────────────────
+            for val in row_cells:
+                if not _is_good_field(val):
+                    continue
+                # Truncate very long values but keep first 200 chars
+                label_text = val[:200].strip()
+                if not label_text:
+                    continue
+                # Build the full question: [Section context] Field label
+                question = f"[{current_section}] {label_text}"
+                key = label_text.lower()[:100]  # dedup key (first 100 chars)
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    all_questions.append(question)
+
+            row_num += 1
+
+    return all_questions
+
+
 def parse_questions(text: str) -> list:
-    """Extract questions from free-form text (numbered, bulleted, or plain lines)."""
+    """Extract questions from free-form text (numbered, bulleted, or plain)."""
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     pat   = re.compile(r'^(?:Q(?:uestion)?\s*)?(\d+)[.):–\-]\s*(.+)', re.I)
     qs    = []
     for line in lines:
         m = pat.match(line)
-        if m:
-            qs.append(m.group(2).strip())
-        elif line.startswith(('-','•','*','–')):
-            qs.append(line.lstrip('-•*– ').strip())
-        else:
-            # Accept plain lines too (no numbering)
-            qs.append(line)
+        if m:   qs.append(m.group(2).strip())
+        elif line.startswith(('-','•','*','–')): qs.append(line.lstrip('-•*– ').strip())
+        else:   qs.append(line)
     seen, out = set(), []
     for q in qs:
-        q = q.strip()
-        if q and _is_question_like(q) and q.lower() not in seen:
-            seen.add(q.lower())
-            out.append(q)
-    return out
-
-
-def _extract_questions_from_df(df: pd.DataFrame) -> list:
-    """
-    Intelligently scan a DataFrame for question-like content.
-    Tries every column and picks the one with the most question-like values.
-    Handles:
-      - Templates with a header row ('Question', 'Field', 'No.', etc.)
-      - Questions in column 0, 1, or any column
-      - Mixed numeric / text columns
-      - Multi-row headers
-    """
-    best_col_vals = []
-
-    for col_idx in range(min(df.shape[1], 6)):   # check first 6 columns max
-        vals = []
-        for raw_val in df.iloc[:, col_idx].dropna():
-            text = str(raw_val).strip()
-            if _is_question_like(text):
-                vals.append(text)
-        if len(vals) > len(best_col_vals):
-            best_col_vals = vals
-
-    # Deduplicate while preserving order
-    seen, out = set(), []
-    for v in best_col_vals:
-        if v.lower() not in seen:
-            seen.add(v.lower())
-            out.append(v)
+        q = re.sub(r'[ \t]+', ' ', q).strip()
+        if q and len(q) >= 3 and q.lower() not in seen:
+            seen.add(q.lower()); out.append(q)
     return out
 
 
 def parse_template_file(f) -> list:
-    """Parse ROPA questions from an uploaded file (XLSX, CSV, DOCX, PDF, TXT)."""
+    """Parse ALL ROPA field labels from an uploaded file (all sheets, all sections)."""
     name = f.name.lower()
     raw  = f.read()
 
@@ -197,28 +304,33 @@ def parse_template_file(f) -> list:
     if name.endswith('.csv'):
         try:
             df = pd.read_csv(io.BytesIO(raw), header=None, dtype=str)
-            qs = _extract_questions_from_df(df)
-            if not qs:
-                # Retry treating first row as header
-                df2 = pd.read_csv(io.BytesIO(raw), dtype=str)
-                qs  = _extract_questions_from_df(df2.reset_index(drop=True))
-            return qs
+            qs = []
+            seen_k = set()
+            for _, row in df.iterrows():
+                for v in row:
+                    t = re.sub(r' +',' ', str(v).strip()) if pd.notna(v) else ''
+                    if _is_good_field(t) and t.lower() not in seen_k:
+                        seen_k.add(t.lower()); qs.append(t)
+            return qs if qs else parse_questions(df.to_csv(index=False))
         except Exception as e:
             st.error(f"CSV parse error: {e}"); return []
 
     # ── XLSX / XLS ───────────────────────────────────────────────────────────
     if name.endswith(('.xlsx', '.xls')):
         try:
-            # Try every sheet; collect questions from all sheets
-            xl = pd.ExcelFile(io.BytesIO(raw))
-            all_qs = []
-            for sheet in xl.sheet_names:
-                df = pd.read_excel(xl, sheet_name=sheet, header=None, dtype=str)
-                qs = _extract_questions_from_df(df)
-                for q in qs:
-                    if q not in all_qs:
-                        all_qs.append(q)
-            return all_qs
+            qs = _read_xlsx_with_openpyxl(raw)
+            if not qs:
+                # Hard fallback: pandas flat scan
+                xl = pd.ExcelFile(io.BytesIO(raw))
+                seen_k = set()
+                for sheet in xl.sheet_names:
+                    df = pd.read_excel(xl, sheet_name=sheet, header=None, dtype=str)
+                    for _, row in df.iterrows():
+                        for v in row:
+                            t = str(v).strip() if pd.notna(v) else ''
+                            if _is_good_field(t) and t.lower() not in seen_k:
+                                seen_k.add(t.lower()); qs.append(t)
+            return qs
         except Exception as e:
             st.error(f"Excel parse error: {e}"); return []
 
@@ -226,16 +338,18 @@ def parse_template_file(f) -> list:
     if name.endswith('.docx'):
         try:
             from docx import Document
-            doc  = Document(io.BytesIO(raw))
-            # Grab text from paragraphs AND table cells
-            parts = [p.text for p in doc.paragraphs if p.text.strip()]
+            doc = Document(io.BytesIO(raw))
+            seen_k, out = set(), []
+            def _add(t):
+                t = re.sub(r' +',' ',t.strip())
+                k = t.lower()
+                if t and _is_good_field(t) and k not in seen_k:
+                    seen_k.add(k); out.append(t)
+            for p in doc.paragraphs: _add(p.text)
             for tbl in doc.tables:
                 for row in tbl.rows:
-                    for cell in row.cells:
-                        if cell.text.strip():
-                            parts.append(cell.text.strip())
-            text = "\n".join(parts)
-            return parse_questions(text)
+                    for cell in row.cells: _add(cell.text)
+            return out
         except Exception as e:
             st.error(f"DOCX parse error: {e}"); return []
 
@@ -251,6 +365,7 @@ def parse_template_file(f) -> list:
 
     st.warning(f"Unsupported file type: {name}")
     return []
+
 
 # ── Transcription (Groq Whisper-large-v3) ────────────────────────────────────
 
@@ -658,26 +773,31 @@ with tab1:
         tf = st.file_uploader("TXT · CSV · XLSX · DOCX · PDF",
                               type=["txt","csv","xlsx","xls","docx","pdf"], key="tf_ropa")
         if tf:
-            with st.spinner(f"Parsing {tf.name}…"):
+            with st.spinner(f"Scanning all sheets & sections in {tf.name}…"):
                 qs = parse_template_file(tf)
             if qs:
                 st.session_state.questions = qs
-                st.markdown(f'<div class="ok">✓ Found {len(qs)} questions in {tf.name}</div>',
-                            unsafe_allow_html=True)
-            else:
-                # Show what was actually in the file to help debug
+                # Count how many distinct sections were found
+                sections = set()
+                for q in qs:
+                    if q.startswith('[') and ']' in q:
+                        sections.add(q.split(']')[0].lstrip('['))
+                sec_info = f" across {len(sections)} sections" if sections else ""
                 st.markdown(
-                    f'<div class="warn">⚠️ Could not extract questions from <b>{tf.name}</b>.<br>' +
-                    'Make sure the file has question text in a column (not just numbers).<br>' +
-                    '<b>Tip:</b> Paste the questions manually in the box below instead.</div>',
+                    f'<div class="ok">✓ Found <b>{len(qs)} field labels</b>{sec_info} in {tf.name}</div>',
                     unsafe_allow_html=True
                 )
-                # Try to show a preview of what was found
+            else:
+                st.markdown(
+                    f'<div class="warn">⚠️ Could not extract fields from <b>{tf.name}</b>. '
+                    f'Try pasting questions manually below.</div>',
+                    unsafe_allow_html=True
+                )
                 try:
                     if tf.name.lower().endswith(('.xlsx','.xls')):
                         tf.seek(0); raw2 = tf.read()
-                        _df = pd.read_excel(io.BytesIO(raw2), header=None, dtype=str, nrows=6)
-                        st.caption("First 6 rows of your file (to see which column has questions):")
+                        _df = pd.read_excel(io.BytesIO(raw2), header=None, dtype=str, nrows=8)
+                        st.caption("Preview of your file (first 8 rows):")
                         st.dataframe(_df, use_container_width=True)
                 except Exception:
                     pass
