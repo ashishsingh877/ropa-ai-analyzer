@@ -157,77 +157,160 @@ def parse_template_file(f):
     st.warning(f"Unsupported file type: {name}"); return []
 
 # ── Transcription (Groq Whisper-large-v3) ────────────────────────────────────
+
+GROQ_MAX_BYTES = 24 * 1024 * 1024   # 24 MB (Groq hard limit is 25 MB)
+
+# MIME type map for correct Content-Type headers
+MIME_MAP = {
+    ".mp3":  "audio/mpeg",
+    ".mp4":  "video/mp4",
+    ".m4a":  "audio/mp4",
+    ".mpeg": "audio/mpeg",
+    ".mpga": "audio/mpeg",
+    ".wav":  "audio/wav",
+    ".webm": "audio/webm",
+    ".ogg":  "audio/ogg",
+    ".flac": "audio/flac",
+}
+
+
+def _normalise_resp(resp) -> dict:
+    """Convert Groq response object → plain dict with text + segments list."""
+    if hasattr(resp, 'model_dump'):
+        data = resp.model_dump()
+    else:
+        data = {
+            "text":     str(getattr(resp, 'text', resp)),
+            "segments": list(getattr(resp, 'segments', []) or []),
+        }
+    raw_segs = data.get("segments") or []
+    segs = []
+    for s in raw_segs:
+        if isinstance(s, dict):
+            segs.append(s)
+        elif hasattr(s, 'model_dump'):
+            segs.append(s.model_dump())
+        else:
+            segs.append({"text": str(s), "start": None, "end": None})
+    data["segments"] = segs
+    return data
+
+
+def _send_to_groq(path: str, client, suffix: str) -> dict:
+    """Send a single audio file path to Groq Whisper. Returns normalised dict."""
+    mime = MIME_MAP.get(suffix, "audio/mpeg")
+    with open(path, "rb") as f:
+        resp = client.audio.transcriptions.create(
+            model="whisper-large-v3",
+            file=(os.path.basename(path), f, mime),
+            response_format="verbose_json",
+            timestamp_granularities=["segment"],
+            temperature=0.0,          # deterministic = more accurate
+        )
+    return _normalise_resp(resp)
+
+
+def _split_audio_pydub(src_path: str, chunk_sec: int = 600) -> list[tuple[str, float]]:
+    """
+    Split audio into chunks of `chunk_sec` seconds using pydub.
+    Returns list of (tmp_path, start_offset_seconds).
+    pydub uses ffmpeg internally — both are in requirements / packages.
+    """
+    from pydub import AudioSegment
+
+    audio = AudioSegment.from_file(src_path)
+    duration_ms = len(audio)
+    chunk_ms    = chunk_sec * 1000
+    chunks      = []
+
+    i = 0
+    offset = 0.0
+    while offset * 1000 < duration_ms:
+        segment = audio[int(offset * 1000): int(offset * 1000) + chunk_ms]
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+        # Export as MP3 — universally accepted by Groq, good compression
+        segment.export(tmp.name, format="mp3", bitrate="64k")
+        tmp.close()
+        chunks.append((tmp.name, offset))
+        offset += chunk_sec
+        i += 1
+
+    return chunks
+
+
 def transcribe_audio(audio_bytes: bytes, filename: str, client) -> dict:
     """
-    Groq supports whisper-large-v3 and whisper-large-v3-turbo.
-    verbose_json gives us word/segment-level timestamps.
-    Max file size: 25 MB. For larger files we split into chunks.
+    Transcribe audio using Groq Whisper-large-v3.
+    • Files ≤ 24 MB  → sent directly (single request).
+    • Files  > 24 MB → split into 10-minute MP3 chunks via pydub/ffmpeg,
+                       each chunk transcribed separately, then stitched.
+    Correct approach: ALWAYS split at proper audio boundaries, never raw bytes.
     """
     suffix = os.path.splitext(filename)[-1].lower() or ".mp3"
-    # Groq Whisper accepted formats
-    accepted = {".mp3",".mp4",".mpeg",".mpga",".m4a",".wav",".webm",".ogg",".flac"}
-    if suffix not in accepted:
+    if suffix not in MIME_MAP:
         suffix = ".mp3"
 
-    MAX_BYTES = 24 * 1024 * 1024   # 24 MB safe limit (Groq limit is 25 MB)
+    # Write full file to a temp path (needed for pydub and direct send)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(audio_bytes)
+        src_path = tmp.name
 
-    def _transcribe_chunk(chunk_bytes, chunk_suffix):
-        with tempfile.NamedTemporaryFile(delete=False, suffix=chunk_suffix) as tmp:
-            tmp.write(chunk_bytes); path = tmp.name
+    try:
+        file_size = len(audio_bytes)
+
+        # ── Small file: send directly ─────────────────────────────────────
+        if file_size <= GROQ_MAX_BYTES:
+            return _send_to_groq(src_path, client, suffix)
+
+        # ── Large file: split properly with pydub ─────────────────────────
+        st.markdown(
+            '<div class="info">📦 File is large — splitting into 10-min chunks '
+            'via ffmpeg (this is normal for Teams/Meet recordings).</div>',
+            unsafe_allow_html=True
+        )
+
         try:
-            with open(path,"rb") as f:
-                resp = client.audio.transcriptions.create(
-                    model="whisper-large-v3",
-                    file=(os.path.basename(path), f, "audio/mpeg"),
-                    response_format="verbose_json",
-                    timestamp_granularities=["segment"],
-                    language="en",         # remove this line if meetings are multilingual
-                    temperature=0.0,       # deterministic for accuracy
-                )
-            return resp
-        finally:
-            os.unlink(path)
+            chunks = _split_audio_pydub(src_path, chunk_sec=600)
+        except Exception as pydub_err:
+            st.error(
+                f"❌ Audio splitting failed: {pydub_err}\n\n"
+                "**Fix:** ffmpeg must be installed on the server.\n"
+                "- **Local:** `brew install ffmpeg` (Mac) or `sudo apt install ffmpeg` (Linux)\n"
+                "- **Streamlit Cloud:** make sure `packages.txt` contains `ffmpeg`"
+            )
+            st.stop()
 
-    if len(audio_bytes) <= MAX_BYTES:
-        resp = _transcribe_chunk(audio_bytes, suffix)
-        # Groq returns an object — normalise to dict
-        if hasattr(resp, 'model_dump'):
-            data = resp.model_dump()
-        else:
-            data = {"text": str(resp.text if hasattr(resp,'text') else resp),
-                    "segments": getattr(resp,'segments',[])}
-        # ensure segments is a list of dicts
-        raw_segs = data.get("segments") or []
-        segs = []
-        for s in raw_segs:
-            if isinstance(s, dict): segs.append(s)
-            elif hasattr(s,'model_dump'): segs.append(s.model_dump())
-            else: segs.append({"text":str(s),"start":None,"end":None})
-        data["segments"] = segs
-        return data
-    else:
-        # File > 24 MB: split by bytes into chunks and transcribe each
-        st.info("📦 File is large — splitting into chunks for transcription…")
-        chunks = [audio_bytes[i:i+MAX_BYTES] for i in range(0,len(audio_bytes),MAX_BYTES)]
-        full_text = ""
-        all_segs  = []
-        time_offset = 0.0
-        for i, chunk in enumerate(chunks):
-            st.caption(f"  Transcribing chunk {i+1}/{len(chunks)}…")
-            resp = _transcribe_chunk(chunk, suffix)
-            if hasattr(resp,'model_dump'): d = resp.model_dump()
-            else: d = {"text": str(resp.text if hasattr(resp,'text') else resp), "segments":[]}
-            full_text += " " + (d.get("text") or "")
-            for s in (d.get("segments") or []):
-                sd = s if isinstance(s,dict) else s.model_dump()
-                sd = dict(sd)
-                if sd.get("start") is not None: sd["start"] += time_offset
-                if sd.get("end")   is not None: sd["end"]   += time_offset
+        full_text   = ""
+        all_segs    = []
+
+        for i, (chunk_path, time_offset) in enumerate(chunks):
+            chunk_size = os.path.getsize(chunk_path)
+            status_msg = f"Transcribing chunk {i+1}/{len(chunks)}…"
+            st.caption(f"  ⏳ {status_msg}")
+            try:
+                d = _send_to_groq(chunk_path, client, ".mp3")
+            except Exception as chunk_err:
+                st.warning(f"⚠️ Chunk {i+1} failed ({chunk_err}) — skipping.")
+                d = {"text": "", "segments": []}
+            finally:
+                try: os.unlink(chunk_path)
+                except: pass
+
+            full_text += (" " if full_text else "") + (d.get("text") or "")
+
+            for s in d.get("segments", []):
+                sd = dict(s)
+                if sd.get("start") is not None:
+                    sd["start"] = round(sd["start"] + time_offset, 2)
+                if sd.get("end") is not None:
+                    sd["end"]   = round(sd["end"]   + time_offset, 2)
                 all_segs.append(sd)
-            # estimate offset: Groq doesn't return duration, so use segment end
-            if all_segs and all_segs[-1].get("end"):
-                time_offset = all_segs[-1]["end"]
+
         return {"text": full_text.strip(), "segments": all_segs}
+
+    finally:
+        try: os.unlink(src_path)
+        except: pass
 
 # ── ROPA Analysis (Groq Llama-3.3-70b) ───────────────────────────────────────
 def analyze_ropa(transcript: str, segments: list, questions: list, client) -> dict:
