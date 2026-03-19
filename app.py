@@ -210,31 +210,38 @@ def _send_to_groq(path: str, client, suffix: str) -> dict:
     return _normalise_resp(resp)
 
 
-def _split_audio_pydub(src_path: str, chunk_sec: int = 600) -> list[tuple[str, float]]:
-    """
-    Split audio into chunks of `chunk_sec` seconds using pydub.
-    Returns list of (tmp_path, start_offset_seconds).
-    pydub uses ffmpeg internally — both are in requirements / packages.
-    """
-    from pydub import AudioSegment
+def _get_duration_ffprobe(src_path: str) -> float:
+    """Return audio duration in seconds using ffprobe."""
+    import subprocess
+    cmd = ["ffprobe","-v","error","-show_entries","format=duration",
+           "-of","default=noprint_wrappers=1:nokey=1", src_path]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    try:
+        return float(result.stdout.strip())
+    except (ValueError, AttributeError):
+        return 3600.0   # fallback: assume 60 min
 
-    audio = AudioSegment.from_file(src_path)
-    duration_ms = len(audio)
-    chunk_ms    = chunk_sec * 1000
-    chunks      = []
 
-    i = 0
-    offset = 0.0
-    while offset * 1000 < duration_ms:
-        segment = audio[int(offset * 1000): int(offset * 1000) + chunk_ms]
+def _split_audio_ffmpeg(src_path: str, chunk_sec: int = 600) -> list:
+    """
+    Split audio into chunks using ffmpeg subprocess directly.
+    No pydub / pyaudioop needed — works on Python 3.13+.
+    Returns list of (tmp_mp3_path, start_offset_seconds).
+    """
+    import subprocess
+    duration = _get_duration_ffprobe(src_path)
+    chunks, offset = [], 0.0
+    while offset < duration:
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-        # Export as MP3 — universally accepted by Groq, good compression
-        segment.export(tmp.name, format="mp3", bitrate="64k")
         tmp.close()
+        cmd = ["ffmpeg","-y","-ss",str(offset),"-t",str(chunk_sec),
+               "-i",src_path,"-ar","16000","-ac","1","-b:a","64k",
+               "-f","mp3", tmp.name]
+        res = subprocess.run(cmd, capture_output=True, timeout=180)
+        if res.returncode != 0:
+            raise RuntimeError(res.stderr.decode("utf-8",errors="ignore")[-400:])
         chunks.append((tmp.name, offset))
         offset += chunk_sec
-        i += 1
-
     return chunks
 
 
@@ -242,7 +249,7 @@ def transcribe_audio(audio_bytes: bytes, filename: str, client) -> dict:
     """
     Transcribe audio using Groq Whisper-large-v3.
     • Files ≤ 24 MB  → sent directly (single request).
-    • Files  > 24 MB → split into 10-minute MP3 chunks via pydub/ffmpeg,
+    • Files  > 24 MB → split into 10-minute MP3 chunks via ffmpeg,
                        each chunk transcribed separately, then stitched.
     Correct approach: ALWAYS split at proper audio boundaries, never raw bytes.
     """
@@ -250,7 +257,7 @@ def transcribe_audio(audio_bytes: bytes, filename: str, client) -> dict:
     if suffix not in MIME_MAP:
         suffix = ".mp3"
 
-    # Write full file to a temp path (needed for pydub and direct send)
+    # Write full file to temp path (needed for ffmpeg and direct send)
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(audio_bytes)
         src_path = tmp.name
@@ -262,7 +269,7 @@ def transcribe_audio(audio_bytes: bytes, filename: str, client) -> dict:
         if file_size <= GROQ_MAX_BYTES:
             return _send_to_groq(src_path, client, suffix)
 
-        # ── Large file: split properly with pydub ─────────────────────────
+        # ── Large file: split properly with ffmpeg ─────────────────────────
         st.markdown(
             '<div class="info">📦 File is large — splitting into 10-min chunks '
             'via ffmpeg (this is normal for Teams/Meet recordings).</div>',
@@ -270,10 +277,10 @@ def transcribe_audio(audio_bytes: bytes, filename: str, client) -> dict:
         )
 
         try:
-            chunks = _split_audio_pydub(src_path, chunk_sec=600)
-        except Exception as pydub_err:
+            chunks = _split_audio_ffmpeg(src_path, chunk_sec=600)
+        except Exception as split_err:
             st.error(
-                f"❌ Audio splitting failed: {pydub_err}\n\n"
+                f"❌ Audio splitting failed: {split_err}\n\n"
                 "**Fix:** ffmpeg must be installed on the server.\n"
                 "- **Local:** `brew install ffmpeg` (Mac) or `sudo apt install ffmpeg` (Linux)\n"
                 "- **Streamlit Cloud:** make sure `packages.txt` contains `ffmpeg`"
