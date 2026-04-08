@@ -697,7 +697,8 @@ th{{padding:.6rem .9rem;text-align:left;font-size:.67rem;color:#22c55e;font-fami
 
 # ── Session state init ────────────────────────────────────────────────────────
 for k,v in {"transcript":None,"segments":[],"questions":[],"ropa_result":None,
-            "mom_result":None,"audio_meta":{}}.items():
+            "mom_result":None,"audio_meta":{},
+            "t3_text":None,"t3_segs":[],"t3_name":""}.items():
     if k not in st.session_state: st.session_state[k]=v
 
 # ── Header ─────────────────────────────────────────────────────────────────────
@@ -745,7 +746,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ── Tabs ───────────────────────────────────────────────────────────────────────
-tab1, tab2 = st.tabs(["🔐  ROPA Analyzer", "📋  Meeting Minutes (.docx)"])
+tab1, tab2, tab3 = st.tabs(["🔐  ROPA Analyzer", "📋  Meeting Minutes (.docx)", "🎙️  Transcribe Audio"])
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 1 — ROPA
@@ -1096,3 +1097,242 @@ with tab2:
                 file_name=f"MOM_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
                 mime="application/json"
             )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 3 — TRANSCRIBE ONLY
+# ══════════════════════════════════════════════════════════════════════════════
+with tab3:
+
+    st.markdown("""
+    <div class="groq-banner">
+      <div class="groq-icon">🎙️</div>
+      <div class="groq-text">
+        <b>Pure Transcription — no ROPA, no MOM.</b>
+        Upload any recording and instantly get a clean, timestamped transcript
+        powered by <b>Groq Whisper-large-v3</b>. Download as TXT or copy directly.
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown('<div class="card"><div class="card-label">Step 1 · Upload Recording</div>'
+                '<div class="card-title">Upload any audio or video file to transcribe</div>',
+                unsafe_allow_html=True)
+
+    t3_file = st.file_uploader(
+        "MP3 · MP4 · M4A · WAV · OGG · WEBM · FLAC",
+        type=["mp3","mp4","m4a","wav","ogg","webm","flac","mpeg","mpga"],
+        key="af_transcribe"
+    )
+
+    t3_lang = st.selectbox(
+        "Language (select for better accuracy)",
+        ["Auto-detect", "English", "Hindi", "Spanish", "French", "German",
+         "Arabic", "Portuguese", "Italian", "Dutch", "Japanese", "Chinese"],
+        key="t3_lang"
+    )
+
+    if t3_file:
+        st.audio(t3_file)
+        size_mb = round(t3_file.size / 1e6, 2)
+        chunk_note = " · Will be auto-split into chunks" if t3_file.size > 24*1024*1024 else ""
+        st.markdown(f'<div class="ok">✓ {t3_file.name} ({size_mb} MB){chunk_note}</div>',
+                    unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # Optional speaker / context hint
+    with st.expander("⚙️ Advanced options"):
+        t3_context = st.text_area(
+            "Context hint (optional) — helps Whisper with domain-specific words",
+            placeholder="e.g. 'This is a data privacy meeting. Terms: GDPR, DPIA, ROPA, controller, processor, data subject, retention period.'",
+            height=80,
+            key="t3_context"
+        )
+
+    if st.button("🎙️  Start Transcription", disabled=(t3_file is None), key="btn_transcribe"):
+        client = get_client()
+
+        # Language code map
+        lang_map = {
+            "Auto-detect": None, "English": "en", "Hindi": "hi",
+            "Spanish": "es", "French": "fr", "German": "de",
+            "Arabic": "ar", "Portuguese": "pt", "Italian": "it",
+            "Dutch": "nl", "Japanese": "ja", "Chinese": "zh"
+        }
+        lang_code = lang_map.get(t3_lang)
+
+        prog = st.progress(0, text="⏳ Transcribing with Groq Whisper-large-v3…")
+        t3_file.seek(0)
+
+        try:
+            # Reuse the existing transcribe_audio function but pass lang_code
+            # We'll call a slightly tweaked version inline
+            import tempfile as _tf, os as _os
+
+            suffix = _os.path.splitext(t3_file.name)[-1].lower() or ".mp3"
+            if suffix not in MIME_MAP: suffix = ".mp3"
+            audio_bytes = t3_file.read()
+
+            with _tf.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                tmp.write(audio_bytes); src_path = tmp.name
+
+            try:
+                file_size = len(audio_bytes)
+
+                def _send_chunk_t3(path):
+                    mime = MIME_MAP.get(_os.path.splitext(path)[-1].lower(), "audio/mpeg")
+                    with open(path,"rb") as f:
+                        kwargs = dict(
+                            model="whisper-large-v3",
+                            file=(_os.path.basename(path), f, mime),
+                            response_format="verbose_json",
+                            timestamp_granularities=["segment"],
+                            temperature=0.0,
+                        )
+                        if lang_code:
+                            kwargs["language"] = lang_code
+                        if t3_context.strip():
+                            kwargs["prompt"] = t3_context.strip()[:224]  # Whisper prompt max
+                        resp = client.audio.transcriptions.create(**kwargs)
+                    return _normalise_resp(resp)
+
+                if file_size <= GROQ_MAX_BYTES:
+                    prog.progress(30, text="⏳ Transcribing…")
+                    result = _send_chunk_t3(src_path)
+                    full_text = result.get("text","")
+                    all_segs  = result.get("segments",[])
+                else:
+                    prog.progress(10, text="📦 Splitting large file into chunks…")
+                    chunks = _split_audio_ffmpeg(src_path, chunk_sec=600)
+                    full_text, all_segs = "", []
+                    for i,(chunk_path, offset) in enumerate(chunks):
+                        pct = 15 + int(75 * i / len(chunks))
+                        prog.progress(pct, text=f"⏳ Transcribing chunk {i+1}/{len(chunks)}…")
+                        try:
+                            d = _send_chunk_t3(chunk_path)
+                        except Exception as ce:
+                            st.warning(f"⚠️ Chunk {i+1} failed: {ce} — skipping")
+                            d = {"text":"","segments":[]}
+                        finally:
+                            try: _os.unlink(chunk_path)
+                            except: pass
+                        full_text += (" " if full_text else "") + (d.get("text") or "")
+                        for s in d.get("segments",[]):
+                            sd = dict(s)
+                            if sd.get("start") is not None: sd["start"] = round(sd["start"]+offset,2)
+                            if sd.get("end")   is not None: sd["end"]   = round(sd["end"]  +offset,2)
+                            all_segs.append(sd)
+
+                prog.progress(100, text="✅ Transcription complete!"); time.sleep(0.4); prog.empty()
+
+                # Store in session
+                st.session_state["t3_text"] = full_text.strip()
+                st.session_state["t3_segs"] = all_segs
+                st.session_state["t3_name"] = t3_file.name
+
+            finally:
+                try: _os.unlink(src_path)
+                except: pass
+
+        except Exception as e:
+            st.error(f"Transcription failed: {e}"); st.stop()
+
+    # ── Results ──────────────────────────────────────────────────────────────
+    if st.session_state.get("t3_text"):
+        text = st.session_state["t3_text"]
+        segs = st.session_state.get("t3_segs", [])
+        fname = st.session_state.get("t3_name","recording")
+
+        word_count = len(text.split())
+        dur_s = segs[-1].get("end") if segs and segs[-1].get("end") else None
+
+        st.markdown(f"""<div class="stat-grid" style="grid-template-columns:repeat(3,1fr);">
+          <div class="stat-box"><div class="sn">{word_count:,}</div><div class="sl">Words</div></div>
+          <div class="stat-box"><div class="sn">{len(segs)}</div><div class="sl">Segments</div></div>
+          <div class="stat-box"><div class="sn">{fmt_time(dur_s) if dur_s else "—"}</div><div class="sl">Duration</div></div>
+        </div>""", unsafe_allow_html=True)
+
+        st.markdown('<div class="ok">✅ Transcription complete — review and download below</div>',
+                    unsafe_allow_html=True)
+
+        tr1, tr2 = st.tabs(["📄 Full Transcript", "🕐 Timestamped Segments"])
+
+        with tr1:
+            # Editable text area so user can correct the transcript
+            edited = st.text_area(
+                "Transcript (you can edit before downloading)",
+                value=text,
+                height=420,
+                key="t3_edited"
+            )
+
+        with tr2:
+            if segs:
+                # Render as a clean table-like view
+                st.markdown('<div style="font-family:monospace;font-size:.8rem;">', unsafe_allow_html=True)
+                for s in segs:
+                    start = fmt_time(s.get("start"))
+                    end   = fmt_time(s.get("end"))
+                    seg_text = s.get("text","").strip()
+                    st.markdown(
+                        f'<div style="padding:.3rem 0;border-bottom:1px solid #0f1420;display:flex;gap:1rem;align-items:flex-start;">'
+                        f'<span style="color:#22c55e;min-width:130px;flex-shrink:0;">[{start} → {end}]</span>'
+                        f'<span style="color:#b0bcda;">{seg_text}</span></div>',
+                        unsafe_allow_html=True
+                    )
+                st.markdown('</div>', unsafe_allow_html=True)
+            else:
+                st.info("No timestamped segments available.")
+
+        # ── Downloads ─────────────────────────────────────────────────────
+        st.markdown("<hr>", unsafe_allow_html=True)
+        st.markdown('<div class="sh">Download Transcript</div>', unsafe_allow_html=True)
+
+        dl_c1, dl_c2, dl_c3 = st.columns(3)
+
+        base_name = _os.path.splitext(fname)[0]
+        ts_stamp  = datetime.now().strftime('%Y%m%d_%H%M')
+
+        with dl_c1:
+            # Plain TXT
+            final_text = st.session_state.get("t3_edited", text)
+            st.download_button(
+                "⬇  Plain Text (.txt)",
+                data=final_text.encode("utf-8"),
+                file_name=f"{base_name}_transcript_{ts_stamp}.txt",
+                mime="text/plain"
+            )
+
+        with dl_c2:
+            # Timestamped TXT
+            ts_lines = ""
+            for s in segs:
+                ts_lines += f"[{fmt_time(s.get('start'))} → {fmt_time(s.get('end'))}]\n{s.get('text','').strip()}\n\n"
+            if not ts_lines:
+                ts_lines = final_text
+            st.download_button(
+                "⬇  Timestamped TXT",
+                data=ts_lines.encode("utf-8"),
+                file_name=f"{base_name}_timestamped_{ts_stamp}.txt",
+                mime="text/plain"
+            )
+
+        with dl_c3:
+            # SRT subtitle format
+            srt_lines = ""
+            for i,s in enumerate(segs, 1):
+                def _srt_time(sec):
+                    if sec is None: return "00:00:00,000"
+                    h,r  = divmod(int(sec), 3600)
+                    m,sc = divmod(r, 60)
+                    ms   = int((sec - int(sec)) * 1000)
+                    return f"{h:02d}:{m:02d}:{sc:02d},{ms:03d}"
+                srt_lines += f"{i}\n{_srt_time(s.get('start'))} --> {_srt_time(s.get('end'))}\n{s.get('text','').strip()}\n\n"
+            if srt_lines:
+                st.download_button(
+                    "⬇  Subtitle File (.srt)",
+                    data=srt_lines.encode("utf-8"),
+                    file_name=f"{base_name}_{ts_stamp}.srt",
+                    mime="text/plain"
+                )
+            else:
+                st.button("⬇  Subtitle File (.srt)", disabled=True)
